@@ -33,6 +33,7 @@
 #include "visual/lightoverlay.hpp"
 #include "visual/shulkerpreview.hpp"
 #include "visual/connectedglass.hpp"
+#include "visual/mobspawnoverlay.hpp"
 #include "player/skinstealer.hpp"
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
@@ -101,7 +102,7 @@ void registerAllModules() {
     registry.emplace<DebugMenuModule>();
     registry.emplace<ViewModelModule>();
     registry.emplace<KeystrokesModule>();
-    registry.emplace<ThirdPersonNametagModule>();
+  registry.emplace<ThirdPersonNametagModule>();
     registry.emplace<TablistModule>();
     registry.emplace<ChunkBorderModule>();
     registry.emplace<HitboxModule>();
@@ -115,4 +116,5 @@ void registerAllModules() {
     registry.emplace<ShulkerPreviewModule>();
     registry.emplace<ConnectedGlassModule>();
     registry.emplace<ForceGlobalRPModule>();
+    registry.emplace<MobSpawnOverlayModule>();
 }
