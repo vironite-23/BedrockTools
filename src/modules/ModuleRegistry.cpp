@@ -34,6 +34,7 @@
 #include "visual/shulkerpreview.hpp"
 #include "visual/connectedglass.hpp"
 #include "visual/mobspawnoverlay.hpp"
+#include "visual/spawnsphere.hpp"
 #include "player/skinstealer.hpp"
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
@@ -117,4 +118,5 @@ void registerAllModules() {
     registry.emplace<ConnectedGlassModule>();
     registry.emplace<ForceGlobalRPModule>();
     registry.emplace<MobSpawnOverlayModule>();
+    registry.emplace<SpawnSphereModule>();
 }
