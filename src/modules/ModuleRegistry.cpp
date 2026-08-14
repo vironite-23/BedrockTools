@@ -38,6 +38,8 @@
 #include "player/skinstealer.hpp"
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
+#include "misc/elytratakeoff.hpp"
+
 
 ModuleRegistry& ModuleRegistry::get() {
     static ModuleRegistry registry;
@@ -119,4 +121,5 @@ void registerAllModules() {
     registry.emplace<ForceGlobalRPModule>();
     registry.emplace<MobSpawnOverlayModule>();
     registry.emplace<SpawnSphereModule>();
+    registry.emplace<ElytraTakeoffModule>();
 }
