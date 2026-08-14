@@ -8,29 +8,12 @@
 #include <string>
 #include <cstring>
 #include <vector>
-#include <utility>
+#include <algorithm>
 
 typedef void (*Tessellator_begin_t)(void* tessellator, void* debugCallback, int primitiveMode, int vertexCount, int noIndices);
 typedef void (*Tessellator_color_t)(void* tessellator, float r, float g, float b, float a);
 typedef void (*Tessellator_vertex_t)(void* tessellator, float x, float y, float z);
 typedef void (*MeshHelpers_renderMeshImmediately_t)(void* screenContext, void* tessellator, void* material, char* pad);
-
-typedef bool (*Actor_isPlayer_t)(void* actor);
-typedef bool (*Actor_isInvisible_t)(void* actor);
-
-struct DistanceSortedActor {
-    void* mActor;
-    float mDistance;
-    float _pad;
-};
-
-struct ActorVec {
-    DistanceSortedActor* begin;
-    DistanceSortedActor* end;
-    DistanceSortedActor* cap;
-};
-
-typedef ActorVec (*Actor_fetchNearbyActorsSorted_t)(void* actor, void* extent, int actorType);
 
 struct HashedString {
     uint64_t mStrHash;
@@ -89,16 +72,12 @@ static uintptr_t resolveADRP(uint32_t* insns, size_t count, uint32_t targetReg) 
     return 0;
 }
 
-static MobSpawnOverlayModule* g_mobSpawnMod = nullptr;
+static MobSpawnOverlayModule* g_mobSpawnOverlayMod = nullptr;
 
 static Tessellator_begin_t                s_tessBegin = nullptr;
 static Tessellator_color_t                s_tessColor = nullptr;
 static Tessellator_vertex_t               s_tessVertex = nullptr;
 static MeshHelpers_renderMeshImmediately_t s_renderMesh = nullptr;
-
-static Actor_isPlayer_t                   s_actorIsPlayer = nullptr;
-static Actor_isInvisible_t                s_actorIsInvisible = nullptr;
-static Actor_fetchNearbyActorsSorted_t    s_actorFetchNearby = nullptr;
 
 static MaterialPtr* s_matSelection = nullptr;
 static uintptr_t    s_renderMaterialGroup = 0;
@@ -106,28 +85,15 @@ static uintptr_t    s_renderMaterialGroup = 0;
 static void (*_renderLevel_orig)(void* _this, void* screenContext, void* a3);
 
 static bedrocktools::sdk::Vec3 g_playerPos = {0.f, 0.f, 0.f};
-static void* g_localPlayerPtr = nullptr;
+static bool g_havePlayerPos = false;
 
-constexpr int kRingSegments = 32;
-constexpr float kWorldBottom = -64.0f;
-constexpr float kWorldTop = 320.0f;
-
-static void s_mobSpawnTickCallback(void* _this) {
-    if (!g_mobSpawnMod || !g_mobSpawnMod->enabled) return;
-    g_localPlayerPtr = _this;
+static void s_mobSpawnOverlayTickCallback(void* _this) {
+    if (!g_mobSpawnOverlayMod || !g_mobSpawnOverlayMod->enabled) return;
     uintptr_t svc = *(uintptr_t*)((uintptr_t)_this + bedrocktools::sdk::offsets::Actor::mStateVectorComponent);
     if (svc != 0) {
         g_playerPos = *(bedrocktools::sdk::Vec3*)svc;
+        g_havePlayerPos = true;
     }
-}
-
-static bedrocktools::sdk::Vec3 getActorPos(void* actor) {
-    bedrocktools::sdk::Vec3 pos = {0.f, 0.f, 0.f};
-    uintptr_t svc = *(uintptr_t*)((uintptr_t)actor + bedrocktools::sdk::offsets::Actor::mStateVectorComponent);
-    if (svc != 0) {
-        pos = *(bedrocktools::sdk::Vec3*)svc;
-    }
-    return pos;
 }
 
 static MaterialPtr* getMaterial(const char* name) {
@@ -149,13 +115,91 @@ static void ensureMaterials() {
     if (!s_matSelection) s_matSelection = getMaterial("selection_box");
 }
 
+// One flat, horizontal "latitude" ring belonging to a spawn/despawn sphere.
+struct SpawnRing {
+    float dy;          // height offset from the sphere center
+    float radius;       // sqrt(R^2 - dy^2)
+    float alphaScale;   // 0..1, multiplies the shell's base alpha
+};
+
+// Slices a sphere of radius R (centered on the player) into a stack of flat
+// horizontal rings, spaced `spacing` blocks apart vertically, always
+// including the dy == 0 equator. This is the 3D analogue of SP_CHECKER's
+// `length(wPos + vec3(0,1,0))` spherical distance check, decomposed into
+// something that can be drawn as line loops instead of evaluated per-pixel.
+static std::vector<SpawnRing> buildSphereRings(float radius, float spacing, int maxRingsPerSide, bool fadeWithHeight, float minAlphaScale) {
+    std::vector<SpawnRing> rings;
+    if (radius <= 0.01f) return rings;
+
+    spacing = std::max(spacing, 0.1f);
+    int maxSteps = static_cast<int>(std::floor(radius / spacing));
+    if (maxRingsPerSide > 0 && maxSteps > maxRingsPerSide) {
+        spacing = radius / static_cast<float>(maxRingsPerSide);
+        maxSteps = maxRingsPerSide;
+    }
+
+    rings.reserve(static_cast<size_t>(maxSteps) * 2 + 1);
+    for (int i = -maxSteps; i <= maxSteps; ++i) {
+        float dy = static_cast<float>(i) * spacing;
+        float sliceRadiusSq = radius * radius - dy * dy;
+        if (sliceRadiusSq <= 0.0001f) continue;
+
+        float sliceRadius = std::sqrt(sliceRadiusSq);
+        float alphaScale = 1.0f;
+        if (fadeWithHeight) {
+            float t = std::min(std::fabs(dy) / radius, 1.0f);
+            alphaScale = 1.0f - t * (1.0f - minAlphaScale);
+        }
+        rings.push_back({dy, sliceRadius, alphaScale});
+    }
+    return rings;
+}
+
+static void drawSphereShell(void* tessellator, void* screenContext, void* material,
+                             const bedrocktools::sdk::Vec3& center, float camX, float camY, float camZ,
+                             const std::vector<SpawnRing>& rings, uint32_t baseColor, int segments) {
+    if (rings.empty() || segments < 3) return;
+
+    int vertexCount = static_cast<int>(rings.size()) * segments * 2;
+    s_tessBegin(tessellator, nullptr, 4, vertexCount, 0);
+
+    const float baseR = ((baseColor >> 16) & 0xFF) / 255.0f;
+    const float baseG = ((baseColor >>  8) & 0xFF) / 255.0f;
+    const float baseB = ((baseColor      ) & 0xFF) / 255.0f;
+    const float baseA = ((baseColor >> 24) & 0xFF) / 255.0f;
+
+    const float step = 6.28318530718f / static_cast<float>(segments);
+
+    for (const auto& ring : rings) {
+        s_tessColor(tessellator, baseR, baseG, baseB, baseA * ring.alphaScale);
+
+        const float y = center.y + ring.dy - camY;
+        for (int i = 0; i < segments; ++i) {
+            float a1 = step * static_cast<float>(i);
+            float a2 = step * static_cast<float>(i + 1);
+
+            float x1 = center.x + std::cos(a1) * ring.radius - camX;
+            float z1 = center.z + std::sin(a1) * ring.radius - camZ;
+            float x2 = center.x + std::cos(a2) * ring.radius - camX;
+            float z2 = center.z + std::sin(a2) * ring.radius - camZ;
+
+            s_tessVertex(tessellator, x1, y, z1);
+            s_tessVertex(tessellator, x2, y, z2);
+        }
+    }
+
+    char pad[0x58];
+    memset(pad, 0, sizeof(pad));
+    s_renderMesh(screenContext, tessellator, material, pad);
+}
+
 static void _renderLevel_hook(void* _this, void* screenContext, void* a3) {
     if (_renderLevel_orig) {
         _renderLevel_orig(_this, screenContext, a3);
     }
 
-    if (!g_mobSpawnMod || !g_mobSpawnMod->enabled) return;
-    if (!g_localPlayerPtr) return;
+    if (!g_mobSpawnOverlayMod || !g_mobSpawnOverlayMod->enabled) return;
+    if (!g_havePlayerPos) return;
     if (!s_tessBegin || !s_tessColor || !s_tessVertex || !s_renderMesh) return;
     if (!screenContext || (uintptr_t)screenContext < 0x1000) return;
 
@@ -172,8 +216,8 @@ static void _renderLevel_hook(void* _this, void* screenContext, void* a3) {
 
     ensureMaterials();
 
-    void* matInner = s_matSelection ? (void*)s_matSelection
-                                    : (void*)(lrpPtr + bedrocktools::sdk::offsets::LevelRendererPlayer::mSelectionOverlayMaterial);
+    void* matOverlay = s_matSelection ? (void*)s_matSelection
+                                       : (void*)(lrpPtr + bedrocktools::sdk::offsets::LevelRendererPlayer::mSelectionOverlayMaterial);
 
     uintptr_t colorHolderPtr = *(uintptr_t*)((uintptr_t)screenContext + bedrocktools::sdk::offsets::ScreenContext::mColorHolder);
     if (!colorHolderPtr || colorHolderPtr < 0x1000) return;
@@ -185,103 +229,33 @@ static void _renderLevel_hook(void* _this, void* screenContext, void* a3) {
     colorHolder[2] = 1.0f;
     colorHolder[3] = 1.0f;
 
-    auto drawBatchedLines = [&](const std::vector<std::pair<bedrocktools::sdk::Vec3, bedrocktools::sdk::Vec3>>& lines, uint32_t color, float opacityMul) {
-        if (lines.empty()) return;
-        float r = ((color >> 16) & 0xFF) / 255.0f;
-        float g = ((color >>  8) & 0xFF) / 255.0f;
-        float b = ((color      ) & 0xFF) / 255.0f;
-        float a = (((color >> 24) & 0xFF) / 255.0f) * opacityMul;
+    // Sphere center matches SP_CHECKER's convention in terrain.fsh:
+    // `length(wPos + vec3(0,1,0))`, i.e. one block above the tracked
+    // player position, rather than the raw feet position.
+    bedrocktools::sdk::Vec3 center = { g_playerPos.x, g_playerPos.y + 1.0f, g_playerPos.z };
 
-        s_tessBegin(tessellator, nullptr, 4, static_cast<int>(lines.size() * 2), 0);
-        s_tessColor(tessellator, r, g, b, a);
+    const int segments = std::max(g_mobSpawnOverlayMod->ringSegments, 3);
+    const float spacing = g_mobSpawnOverlayMod->ringVerticalSpacing;
+    const int maxRingsPerSide = g_mobSpawnOverlayMod->maxRingsPerSide;
+    const bool fade = g_mobSpawnOverlayMod->fadeWithHeight;
+    const float minAlphaScale = g_mobSpawnOverlayMod->minHeightAlphaScale;
 
-        for (const auto& line : lines) {
-            bedrocktools::sdk::Vec3 p1 = line.first;
-            bedrocktools::sdk::Vec3 p2 = line.second;
-            p1.x -= camX; p1.y -= camY; p1.z -= camZ;
-            p2.x -= camX; p2.y -= camY; p2.z -= camZ;
-            s_tessVertex(tessellator, p1.x, p1.y, p1.z);
-            s_tessVertex(tessellator, p2.x, p2.y, p2.z);
-        }
+    const float spawnRadius = std::max(g_mobSpawnOverlayMod->spawnRadius, 1.0f);
+    const float despawnRadius = std::max(
+        static_cast<float>(g_mobSpawnOverlayMod->renderDistanceChunks) * 16.0f,
+        spawnRadius + g_mobSpawnOverlayMod->minDespawnMargin
+    );
 
-        char pad[0x58];
-        memset(pad, 0, sizeof(pad));
-        s_renderMesh(screenContext, tessellator, matInner, pad);
-    };
+    if (g_mobSpawnOverlayMod->showDespawnRing) {
+        auto rings = buildSphereRings(despawnRadius, spacing, maxRingsPerSide, fade, minAlphaScale);
+        drawSphereShell(tessellator, screenContext, matOverlay, center, camX, camY, camZ,
+                         rings, g_mobSpawnOverlayMod->despawnColor, segments);
+    }
 
-    // Builds a horizontal ring outline (kRingSegments-gon approximating a circle) at height y.
-    auto buildRing = [&](const bedrocktools::sdk::Vec3& center, float radius, float y,
-                          std::vector<std::pair<bedrocktools::sdk::Vec3, bedrocktools::sdk::Vec3>>& out) {
-        bedrocktools::sdk::Vec3 prev{
-            center.x + radius,
-            y,
-            center.z
-        };
-        for (int i = 1; i <= kRingSegments; ++i) {
-            float theta = (2.0f * 3.14159265f * static_cast<float>(i)) / static_cast<float>(kRingSegments);
-            bedrocktools::sdk::Vec3 cur{
-                center.x + radius * std::cos(theta),
-                y,
-                center.z + radius * std::sin(theta)
-            };
-            out.push_back({prev, cur});
-            prev = cur;
-        }
-    };
-
-    // Builds vertical pillars sampled around the ring circumference, from bottom to top of the world.
-    auto buildPillars = [&](const bedrocktools::sdk::Vec3& center, float radius,
-                             std::vector<std::pair<bedrocktools::sdk::Vec3, bedrocktools::sdk::Vec3>>& out) {
-        constexpr int pillarCount = 8;
-        for (int i = 0; i < pillarCount; ++i) {
-            float theta = (2.0f * 3.14159265f * static_cast<float>(i)) / static_cast<float>(pillarCount);
-            float px = center.x + radius * std::cos(theta);
-            float pz = center.z + radius * std::sin(theta);
-            out.push_back({
-                bedrocktools::sdk::Vec3{px, kWorldBottom, pz},
-                bedrocktools::sdk::Vec3{px, kWorldTop, pz}
-            });
-        }
-    };
-
-    auto renderAround = [&](const bedrocktools::sdk::Vec3& center) {
-        std::vector<std::pair<bedrocktools::sdk::Vec3, bedrocktools::sdk::Vec3>> innerLines;
-        std::vector<std::pair<bedrocktools::sdk::Vec3, bedrocktools::sdk::Vec3>> outerLines;
-
-        const float innerR = g_mobSpawnMod->innerRadius;
-        const float outerR = static_cast<float>(g_mobSpawnMod->renderDistanceChunks) * 16.0f;
-
-        if (g_mobSpawnMod->showHorizontal) {
-            if (g_mobSpawnMod->showInnerRing && innerR > 0.0f) buildRing(center, innerR, center.y, innerLines);
-            if (outerR > 0.0f) buildRing(center, outerR, center.y, outerLines);
-        }
-
-        if (g_mobSpawnMod->showVertical) {
-            if (g_mobSpawnMod->showInnerRing && innerR > 0.0f) buildPillars(center, innerR, innerLines);
-            if (outerR > 0.0f) buildPillars(center, outerR, outerLines);
-        }
-
-        drawBatchedLines(innerLines, g_mobSpawnMod->innerColor, g_mobSpawnMod->opacity);
-        drawBatchedLines(outerLines, g_mobSpawnMod->outerColor, g_mobSpawnMod->opacity);
-    };
-
-    renderAround(g_playerPos);
-
-    if (g_mobSpawnMod->showOtherPlayers && s_actorFetchNearby) {
-        const float outerR = static_cast<float>(g_mobSpawnMod->renderDistanceChunks) * 16.0f;
-        bedrocktools::sdk::Vec3 extent = {outerR, 64.0f, outerR};
-        ActorVec actors = s_actorFetchNearby(g_localPlayerPtr, &extent, 1);
-
-        if (actors.begin && actors.end) {
-            for (DistanceSortedActor* it = actors.begin; it < actors.end; ++it) {
-                void* ent = it->mActor;
-                if (!ent || ent == g_localPlayerPtr) continue;
-                if (!s_actorIsPlayer || !s_actorIsPlayer(ent)) continue;
-                if (s_actorIsInvisible && s_actorIsInvisible(ent)) continue;
-
-                renderAround(getActorPos(ent));
-            }
-        }
+    if (g_mobSpawnOverlayMod->showSpawnRing) {
+        auto rings = buildSphereRings(spawnRadius, spacing, maxRingsPerSide, fade, minAlphaScale);
+        drawSphereShell(tessellator, screenContext, matOverlay, center, camX, camY, camZ,
+                         rings, g_mobSpawnOverlayMod->spawnColor, segments);
     }
 
     colorHolder[0] = savedColor[0];
@@ -291,33 +265,21 @@ static void _renderLevel_hook(void* _this, void* screenContext, void* a3) {
 }
 
 MobSpawnOverlayModule::MobSpawnOverlayModule()
-    : Module("Mob Spawn Overlay", "Shows where hostile mobs can spawn around players.") {
+    : Module("Mob Spawn Overlay", "Floating spawn/despawn sphere rings around the player.") {
 
     showInMenu = true;
-
-    showHorizontal = true;
-    showVertical = false;
-    showInnerRing = true;
-    showOtherPlayers = false;
-
-    innerRadius = 24.0f;        // vanilla: mobs won't spawn within 24 blocks of any player
-    renderDistanceChunks = 8;   // outer boundary in chunks (x16 blocks)
-
-    innerColor = 0xFFFF3B30;    // red-ish: no-spawn zone
-    outerColor = 0xFF34C759;    // green-ish: outer spawn boundary
-    opacity = 0.6f;
-
     m_patched = false;
     m_patchTarget = nullptr;
     m_tessBeginAddr = nullptr;
     m_tessColorAddr = nullptr;
     m_tessVertexAddr = nullptr;
+    m_renderMeshAddr = nullptr;
     m_renderMaterialGroupAddr = nullptr;
-    g_mobSpawnMod = this;
+    g_mobSpawnOverlayMod = this;
 }
 
 MobSpawnOverlayModule::~MobSpawnOverlayModule() {
-    if (g_mobSpawnMod == this) g_mobSpawnMod = nullptr;
+    if (g_mobSpawnOverlayMod == this) g_mobSpawnOverlayMod = nullptr;
 }
 
 void MobSpawnOverlayModule::onInit() {
@@ -337,6 +299,7 @@ void MobSpawnOverlayModule::onInit() {
 
     uintptr_t rm = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::MeshHelpersRenderMeshImmediately2);
     if (rm) {
+        m_renderMeshAddr = (void*)rm;
         s_renderMesh = (MeshHelpers_renderMeshImmediately_t)rm;
     } else {
         uintptr_t rm5 = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::MeshHelpersRenderMeshImmediately);
@@ -352,20 +315,14 @@ void MobSpawnOverlayModule::onInit() {
         }
     }
 
-    uintptr_t aip = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsPlayer);
-    if (aip) s_actorIsPlayer = (Actor_isPlayer_t)aip;
-
-    uintptr_t aii = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorIsInvisible);
-    if (aii) s_actorIsInvisible = (Actor_isInvisible_t)aii;
-
-    uintptr_t afn = bedrocktools::memory::resolve(bedrocktools::memory::SignatureId::ActorFetchNearbyActorsSorted);
-    if (afn) s_actorFetchNearby = (Actor_fetchNearbyActorsSorted_t)afn;
-
-    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](auto& event) { s_mobSpawnTickCallback(event.player); });
+    bedrocktools::events::bus().subscribe<bedrocktools::events::LocalPlayerTickEvent>([](auto& event) { s_mobSpawnOverlayTickCallback(event.player); });
 }
 
 void MobSpawnOverlayModule::applyPatch() {
-    if (m_patched || !m_patchTarget) return;
+    if (m_patched) return;
+    if (!m_patchTarget) {
+        return;
+    }
     bedrocktools::hooks::install(m_patchTarget, (void*)_renderLevel_hook, (void**)&_renderLevel_orig);
     m_patched = true;
 }
@@ -379,13 +336,19 @@ void MobSpawnOverlayModule::onDisable() {
 
 void MobSpawnOverlayModule::loadConfig(const nlohmann::json& j) {
     Module::loadConfig(j);
-    showHorizontal = j.value("showHorizontal", showHorizontal);
-    showVertical = j.value("showVertical", showVertical);
-    showInnerRing = j.value("showInnerRing", showInnerRing);
-    showOtherPlayers = j.value("showOtherPlayers", showOtherPlayers);
-    innerRadius = j.value("innerRadius", innerRadius);
+    spawnRadius = j.value("spawnRadius", spawnRadius);
     renderDistanceChunks = j.value("renderDistanceChunks", renderDistanceChunks);
-    opacity = j.value("opacity", opacity);
+    minDespawnMargin = j.value("minDespawnMargin", minDespawnMargin);
+
+    showSpawnRing = j.value("showSpawnRing", showSpawnRing);
+    showDespawnRing = j.value("showDespawnRing", showDespawnRing);
+
+    ringSegments = j.value("ringSegments", ringSegments);
+    ringVerticalSpacing = j.value("ringVerticalSpacing", ringVerticalSpacing);
+    maxRingsPerSide = j.value("maxRingsPerSide", maxRingsPerSide);
+
+    fadeWithHeight = j.value("fadeWithHeight", fadeWithHeight);
+    minHeightAlphaScale = j.value("minHeightAlphaScale", minHeightAlphaScale);
 
     auto parseColor = [&](const std::string& key, uint32_t& outColor) {
         if (j.contains(key)) {
@@ -396,24 +359,30 @@ void MobSpawnOverlayModule::loadConfig(const nlohmann::json& j) {
         }
     };
 
-    parseColor("innerColor", innerColor);
-    parseColor("outerColor", outerColor);
+    parseColor("spawnColor", spawnColor);
+    parseColor("despawnColor", despawnColor);
 }
 
 void MobSpawnOverlayModule::saveConfig(nlohmann::json& j) {
     Module::saveConfig(j);
-    j["showHorizontal"] = showHorizontal;
-    j["showVertical"] = showVertical;
-    j["showInnerRing"] = showInnerRing;
-    j["showOtherPlayers"] = showOtherPlayers;
-    j["innerRadius"] = innerRadius;
+    j["spawnRadius"] = spawnRadius;
     j["renderDistanceChunks"] = renderDistanceChunks;
-    j["opacity"] = opacity;
+    j["minDespawnMargin"] = minDespawnMargin;
 
-    char hexI[12], hexO[12];
-    snprintf(hexI, sizeof(hexI), "#%08X", innerColor);
-    snprintf(hexO, sizeof(hexO), "#%08X", outerColor);
+    j["showSpawnRing"] = showSpawnRing;
+    j["showDespawnRing"] = showDespawnRing;
 
-    j["innerColor"] = std::string(hexI);
-    j["outerColor"] = std::string(hexO);
+    j["ringSegments"] = ringSegments;
+    j["ringVerticalSpacing"] = ringVerticalSpacing;
+    j["maxRingsPerSide"] = maxRingsPerSide;
+
+    j["fadeWithHeight"] = fadeWithHeight;
+    j["minHeightAlphaScale"] = minHeightAlphaScale;
+
+    char hexS[12], hexD[12];
+    snprintf(hexS, sizeof(hexS), "#%08X", spawnColor);
+    snprintf(hexD, sizeof(hexD), "#%08X", despawnColor);
+
+    j["spawnColor"] = std::string(hexS);
+    j["despawnColor"] = std::string(hexD);
 }
