@@ -142,7 +142,10 @@ void registerModulesWithLauncher() {
                 } else {
                     int minVal = 0;
                     int maxVal = 200;
-                    if (kLower.find("cps") != std::string::npos) {
+                    if (kLower == "renderdistance") {
+                        minVal = 25;
+                        maxVal = 128;
+                    } else if (kLower.find("cps") != std::string::npos) {
                         minVal = 1;
                         maxVal = 30;
                     } else if (kLower.find("time") != std::string::npos) {
@@ -163,6 +166,7 @@ void registerModulesWithLauncher() {
                 float maxVal = 100.0f;
 
                 if (kLower.find("opacity") != std::string::npos ||
+                    kLower.find("transparency") != std::string::npos ||
                     kLower.find("color") != std::string::npos ||
                     kLower.find("alpha") != std::string::npos) {
                     maxVal = 1.0f;

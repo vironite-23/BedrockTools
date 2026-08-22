@@ -33,12 +33,11 @@
 #include "visual/lightoverlay.hpp"
 #include "visual/shulkerpreview.hpp"
 #include "visual/connectedglass.hpp"
-#include "visual/mobspawnoverlay.hpp"
-#include "visual/spawnsphere.hpp"
 #include "player/skinstealer.hpp"
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
-#include "misc/elytratakeoff.hpp"
+#include "visual/mobspawnpoint.hpp"
+
 
 
 ModuleRegistry& ModuleRegistry::get() {
@@ -105,7 +104,7 @@ void registerAllModules() {
     registry.emplace<DebugMenuModule>();
     registry.emplace<ViewModelModule>();
     registry.emplace<KeystrokesModule>();
-  registry.emplace<ThirdPersonNametagModule>();
+    registry.emplace<ThirdPersonNametagModule>();
     registry.emplace<TablistModule>();
     registry.emplace<ChunkBorderModule>();
     registry.emplace<HitboxModule>();
@@ -119,7 +118,5 @@ void registerAllModules() {
     registry.emplace<ShulkerPreviewModule>();
     registry.emplace<ConnectedGlassModule>();
     registry.emplace<ForceGlobalRPModule>();
-    registry.emplace<MobSpawnOverlayModule>();
-    registry.emplace<SpawnSphereModule>();
-    registry.emplace<ElytraTakeoffModule>();
+    registry.emplace<MobSpawnPointModule>();
 }
