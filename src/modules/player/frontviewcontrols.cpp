@@ -4,6 +4,7 @@
 #include <bedrocktools/memory/Signatures.hpp>
 #include <bedrocktools/sdk/Offsets.hpp>
 #include <bedrocktools/sdk/Types.hpp>
+#include "core/memory/Hooks.hpp"
 #include <entt/entt.hpp>
 
 #include <array>
@@ -27,10 +28,12 @@ struct EntityIdTraits {
     static constexpr std::uint32_t version_mask = 0x3FFF;
 };
 
+namespace entt {
 template<>
-struct entt::entt_traits<EntityId> : entt::basic_entt_traits<EntityIdTraits> {
+struct entt_traits<::EntityId> : basic_entt_traits<::EntityIdTraits> {
     static constexpr std::size_t page_size = ENTT_SPARSE_PAGE;
 };
+} // namespace entt
 
 struct MoveInputState {
     bitset<27, std::uint32_t> mFlagValues;
