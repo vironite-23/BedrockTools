@@ -37,6 +37,7 @@
 #include "player/autogg.hpp"
 #include "player/autoreq.hpp"
 #include "visual/mobspawnpoint.hpp"
+#include "player/frontviewcontrols.hpp"
 
 
 
@@ -119,4 +120,5 @@ void registerAllModules() {
     registry.emplace<ConnectedGlassModule>();
     registry.emplace<ForceGlobalRPModule>();
     registry.emplace<MobSpawnPointModule>();
+    registry.emplace<FrontViewControlsModule>();
 }

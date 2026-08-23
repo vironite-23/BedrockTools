@@ -143,7 +143,7 @@ void registerModulesWithLauncher() {
                     int minVal = 0;
                     int maxVal = 200;
                     if (kLower == "renderdistance") {
-                        minVal = 25;
+                        minVal = 1;
                         maxVal = 128;
                     } else if (kLower.find("cps") != std::string::npos) {
                         minVal = 1;

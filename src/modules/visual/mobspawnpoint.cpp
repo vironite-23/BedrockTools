@@ -318,7 +318,7 @@ MobSpawnPointModule::MobSpawnPointModule()
     : Module("Mob spawn point",
              "Shows the mob spawn-distance area around the player.") {
     showInMenu = true;
-    renderDistance = 32;
+    renderDistance = 6;
     transparency = 0.25f;
     overlayColor = 0xFF55FF55;
     g_mobSpawnPointMod = this;
@@ -430,7 +430,7 @@ void MobSpawnPointModule::loadConfig(const nlohmann::json& j) {
     renderDistance = j.value("renderDistance", renderDistance);
     transparency = j.value("transparency", transparency);
 
-    renderDistance = std::clamp(renderDistance, 25, 128);
+    renderDistance = std::clamp(renderDistance, 1, 128);
     transparency = std::clamp(transparency, 0.0f, 1.0f);
 
     if (j.contains("overlayColor")) {
